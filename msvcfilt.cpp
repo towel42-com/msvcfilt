@@ -2,19 +2,16 @@
 #include <memory>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
-
 #include <cstring>
+#include <list>
+#include <optional>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <DbgHelp.h>
-
-using namespace std;
-
-/// The regex pattern to recognize a decorated symbol. Only a guess.
-static const char *DECORATED_SYMBOL_PATTERN = "\\?[a-zA-Z0-9_@?$]+";
 
 //------------------------------------------------------------------------------
 
@@ -27,162 +24,188 @@ static const char *DECORATED_SYMBOL_PATTERN = "\\?[a-zA-Z0-9_@?$]+";
  */
 class SymbolHandler
 {
-public:
-  /// The maximum length of a symbol name in bytes
-  static const size_t MAX_SYMBOL_NAME_LEN = MAX_SYM_NAME;
+    using TBufferType = std::unique_ptr< char[] >;
 
-  /**
-   * Undecorates a decorated symbol.
-   *
-   * @param symbol The symbol to undecorate
-   * @param result Receives the result
-   *
-   * @return True if the symbol was undecorated, otherwise false
-   */
-  bool UndecorateSymbol(const string &symbol, string &result)
-  {
-    DWORD res = UnDecorateSymbolName(symbol.c_str(), undecorateBuffer.get(),
-                                     MAX_SYMBOL_NAME_LEN, UNDNAME_COMPLETE);
-
-    bool success = (res != 0);
-    if (success)
+    /// Default constructor
+    SymbolHandler()
     {
-      result = undecorateBuffer.get();
+        fUndecoratedBuffer = TBufferType( new char[ kMAX_SYMBOL_NAME_LEN + 1 ] );
+        fProc = GetCurrentProcess();
+        if ( !SymInitialize( fProc, nullptr, false ) )
+            fProc = nullptr;
     }
 
-    return success;
-  }
+    /// Destructor
+    ~SymbolHandler()
+    {
+        if ( fProc )
+        {
+            SymCleanup( fProc );
+        }
+    }
 
-  /// Returns the singleton instance of the class
-  static SymbolHandler &GetInstance()
-  {
-    static SymbolHandler instance;
-    return instance;
-  }
+public:
+    /// The maximum length of a symbol name in bytes
+    static const size_t kMAX_SYMBOL_NAME_LEN = MAX_SYM_NAME;
+
+    SymbolHandler( const SymbolHandler & ) = delete;
+    SymbolHandler &operator=( const SymbolHandler & ) = delete;
+
+    std::optional< std::string > UndecorateSymbol( const std::string_view &symbol )
+    {
+        auto res = UnDecorateSymbolName( std::string( symbol ).c_str(), fUndecoratedBuffer.get(), kMAX_SYMBOL_NAME_LEN, UNDNAME_COMPLETE );
+
+        bool success = ( res != 0 );
+        if ( success )
+        {
+            return fUndecoratedBuffer.get();
+        }
+
+        return {};
+    }
+
+    /// Returns the singleton instance of the class
+    static SymbolHandler &GetInstance()
+    {
+        static SymbolHandler instance;
+        return instance;
+    }
 
 private:
-  /// True if the instance was successfully initialized
-  bool initialized;
-  /// Windows handle for the current process
-  HANDLE hProc;
-  /// Internal buffer that receives the undecorated symbols
-  unique_ptr<char[]> undecorateBuffer;
-
-  // no copy ctor, copy assignment
-  SymbolHandler(const SymbolHandler &);
-  SymbolHandler &operator=(const SymbolHandler &);
-
-  /// Default constructor
-  SymbolHandler()
-    : initialized(false), hProc(0)
-  {
-    hProc = GetCurrentProcess();
-    if (SymInitialize(hProc, NULL, FALSE) == TRUE)
-    {
-      initialized = true;
-
-      // allocate the buffer that receives the undecorated symbols
-      undecorateBuffer.reset(new char[MAX_SYMBOL_NAME_LEN]);
-    }
-  }
-
-  /// Destructor
-  ~SymbolHandler()
-  {
-    if (initialized)
-    {
-      SymCleanup(hProc);
-    }
-  }
+    /// True if the instance was successfully initialized
+    /// Windows handle for the current process
+    HANDLE fProc{ nullptr };
+    /// Internal buffer that receives the undecorated symbols
+    TBufferType fUndecoratedBuffer;
 };
+
+void showHelp()
+{
+    std::cout   //
+        << "Usage: msvcfilt [OPTIONS] <decorated string>..." << std::endl
+        << "Searches input stream for Microsoft Visual C++ decorated symbol names" << std::endl
+        << "and replaces them with their undecorated equivalent." << std::endl
+        << std::endl
+        << "Options:" << std::endl
+        << "    -help, --help    Display this help and exit." << std::endl
+        << "    -keep, --keep    Does not replace the original, decorated symbol name." << std::endl
+        << "                     Instead, the undecorated name will be inserted after it." << std::endl
+        << "    Uses STDIN rather than <decorated string> if not set" << std::endl;
+
+    return;
+}
+
+bool gKeepOldName = false;
+std::optional< std::list< std::string > > gInputStrings;
+
+bool processArgs( int argc, char **argv )
+{
+    for ( int idx = 1; idx < argc; ++idx )
+    {
+        if ( strcmp( "-help", argv[ idx ] ) == 0 || strcmp( "--help", argv[ idx ] ) == 0 )
+        {
+            showHelp();
+            return false;
+        }
+        else if ( std::strcmp( "-keep", argv[ idx ] ) == 0 || std::strcmp( "--keep", argv[ idx ] ) == 0 )
+        {
+            gKeepOldName = true;
+        }
+        else
+        {
+            if ( !gInputStrings.has_value() )
+                gInputStrings = std::list< std::string >();
+            gInputStrings.value().emplace_back( argv[ idx ] );
+        }
+    }
+    return true;
+}
 
 //------------------------------------------------------------------------------
 
-int main(int argc, char **argv)
+static bool inputValid()
 {
-  // if false, the decorated name will be replaced by the undecorated name.
-  // is set by a command line option.
-  bool keepOldName = false;
+    if ( !gInputStrings.has_value() )
+        return std::cin.good();
+    else
+        return !gInputStrings.value().empty();
+}
 
-  // process cmdline arguments
-  if (argc > 1)
-  {
-    for (int idx = 1; idx < argc; ++idx)
+static std::optional< std::string > getNextLine()
+{
+    if ( !inputValid() )
+        return {};
+
+    std::string line;
+    if ( !gInputStrings.has_value() )
     {
-      if (strcmp("-help", argv[idx]) == 0 ||
-          strcmp("--help", argv[idx]) == 0)
-      {
-        cout << "Usage: msvcfilt [OPTIONS]..." << endl
-             << "Searches in STDIN for Microsoft Visual C++ decorated symbol names" << endl
-             << "and replaces them with their undecorated equivalent." << endl
-             << endl
-             << "Options:" << endl
-             << "\t-help, --help\tDisplay this help and exit." << endl
-             << "\t-keep, --keep\tDoes not replace the original, decorated symbol name." << endl
-             << "\t             \tInstead, the undecorated name will be inserted after it." << endl
-             << endl;
+        std::getline( std::cin, line );
+    }
+    else
+    {
+        if ( !gInputStrings.value().empty() )
+        {
+            line = gInputStrings.value().front();
+            gInputStrings.value().pop_front();
+        }
+    }
+    return line;
+}
 
+int main( int argc, char **argv )
+{
+    if ( !processArgs( argc, argv ) )
         return 0;
-      }
-      else if (strcmp("-keep", argv[idx]) == 0 ||
-               strcmp("--keep", argv[idx]) == 0)
-      {
-        keepOldName = true;
-      }
-    }
-  }
 
-  // instantiate the regex pattern to search for
-  regex pattern(DECORATED_SYMBOL_PATTERN);
+    /// The regex pattern to recognize a decorated symbol. Only a guess.
+    static const char *DECORATED_SYMBOL_PATTERN = R"__(\?[a-zA-Z0-9_@?$]+)__";
 
-  while (cin.good())
-  {
-    // read a line
-    string line;
-    getline(cin, line);
+    // instantiate the regex pattern to search for
+    std::regex pattern( DECORATED_SYMBOL_PATTERN );
 
-    // for every match, store the position and length of the original text,
-    // and the string with which it will be replaced
-    typedef tuple<size_t, size_t, string> replacement;
-    vector<replacement> replacement_list;
+    std::optional< std::string > line;
 
-    // iterate through the matches, store them and prepare the undecorated name
-    const sregex_token_iterator end;
-    for (sregex_token_iterator it(line.begin(), line.end(), pattern); it != end; ++it)
+    while ( ( line = getNextLine() ).has_value() )
     {
-      string result;
+        // find every match
+        // print out data from end of previous match, till the start of the current one
+        // print out the undecorated string
+        // continue as long as there is a match
+        // print out the remainder
+        auto it = std::sregex_token_iterator( line.value().begin(), line.value().end(), pattern );
+        const std::sregex_token_iterator end;
 
-      bool success = SymbolHandler::GetInstance().UndecorateSymbol(it->str(), result);
-      if (success)
-      {
-        tuple_element<0, replacement>::type pos = it->first - line.begin();
-        tuple_element<1, replacement>::type len = it->length();
+        std::string::const_iterator prevPos = line.value().begin();
+        for ( ; it != end; ++it )
+        {
+            auto startPos = ( *it ).first;
+            auto endPos = ( *it ).second;
 
-        replacement_list.push_back(make_tuple(pos, len, result));
-      }
+            std::cout << std::string_view( prevPos, startPos );
+            prevPos = endPos;
+
+            auto symbol = std::string_view( startPos, endPos );
+
+            auto result = SymbolHandler::GetInstance().UndecorateSymbol( symbol );
+            if ( !result.has_value() )
+            {
+                continue;
+            }
+
+            if ( gKeepOldName )
+            {
+                std::cout << ( *it ).str() << R"__( ")__" + result.value() + R"__(")__";
+            }
+            else
+            {
+                std::cout << result.value();
+            }
+        }
+
+        if ( prevPos != line.value().end() )
+        {
+            std::cout << &( *prevPos );
+        }
+        std::cout << std::endl;
     }
-
-    // now process the replacements. the vector is traversed in reverse so that
-    // the positions in the original string stay valid.
-    for (auto it = replacement_list.rbegin(); it != replacement_list.rend(); ++it)
-    {
-      // 0 : position in original string
-      // 1 : length of text in original string
-      // 2 : replacement string
-      if (keepOldName)
-      {
-        auto insertText = get<2>(*it);
-        insertText.insert(0, " \"", 2);
-        insertText += '"';
-
-        line.insert(get<0>(*it) + get<1>(*it), insertText);
-      }
-      else
-      {
-        line.replace(get<0>(*it), get<1>(*it), get<2>(*it));
-      }
-    }
-
-    cout << line << endl;
-  }
 }
